@@ -1,198 +1,155 @@
-#![cfg_attr(not(test), no_main)]
+// Allow `cargo stylus export-abi` to generate a main function.
+#![cfg_attr(not(any(test, feature = "export-abi")), no_main)]
 extern crate alloc;
 
-use alloc::vec::Vec;
+use stylus_sdk::{alloy_primitives::U256, prelude::*, msg, storage::{StorageU256, StorageString}};
+use alloc::{string::String, vec::Vec};
 
-use alloy_primitives::{Address, FixedBytes, U256};
-use openzeppelin_stylus::{
-    token::erc721::{
-        self,
-        extensions::{
-            enumerable, Erc721Enumerable as Enumerable, IErc721Burnable,
-        },
-        Erc721, IErc721,
-    },
-    utils::{introspection::erc165::IErc165, pausable, Pausable},
-};
-use stylus_sdk::{abi::Bytes, prelude::*};
+use openzeppelin_stylus::token::erc721::Erc721;
 
-#[derive(SolidityError, Debug)]
-enum Error {
-    Enumerable(enumerable::Error),
-    Erc721(erc721::Error),
-    Pausable(pausable::Error),
-}
 
 #[entrypoint]
 #[storage]
-struct Erc721Token {
+pub struct NFT {
     #[borrow]
-    erc721: Erc721,
-    #[borrow]
-    enumerable: Enumerable,
-    #[borrow]
-    pausable: Pausable,
+    pub erc721: Erc721,
+    pub token_supply: StorageU256,
+    pub name: StorageString,
+    pub symbol: StorageString,
 }
 
 #[public]
-#[inherit(Erc721, Enumerable, Pausable)]
-impl Erc721Token {
-    fn burn(&mut self, token_id: U256) -> Result<(), Error> {
-        self.pausable.when_not_paused()?;
+#[inherit(Erc721)]
+impl NFT {
 
-        // Retrieve the owner.
-        let owner = self.erc721.owner_of(token_id)?;
-
-        self.erc721.burn(token_id)?;
-
-        // Update the extension's state.
-        self.enumerable._remove_token_from_owner_enumeration(
-            owner,
-            token_id,
-            &self.erc721,
-        )?;
-        self.enumerable._remove_token_from_all_tokens_enumeration(token_id);
-
-        Ok(())
+    pub fn mint(&mut self) -> Result<(), Vec<u8>> {
+        let to = msg::sender();
+        let token_id = self.token_supply.get() + U256::from(1);
+        self.token_supply.set(token_id);
+        Ok(self.erc721._mint(to, token_id)?)
     }
 
-    fn mint(&mut self, to: Address, token_id: U256) -> Result<(), Error> {
-        self.pausable.when_not_paused()?;
-
-        self.erc721._mint(to, token_id)?;
-
-        // Update the extension's state.
-        self.enumerable._add_token_to_all_tokens_enumeration(token_id);
-        self.enumerable._add_token_to_owner_enumeration(
-            to,
-            token_id,
-            &self.erc721,
-        )?;
-
-        Ok(())
+    pub fn name(&self) -> Result<String, Vec<u8>> {
+        Ok($self.name)
     }
 
-    fn safe_mint(
-        &mut self,
-        to: Address,
-        token_id: U256,
-        data: Bytes,
-    ) -> Result<(), Error> {
-        self.pausable.when_not_paused()?;
-
-        self.erc721._safe_mint(to, token_id, &data)?;
-
-        // Update the extension's state.
-        self.enumerable._add_token_to_all_tokens_enumeration(token_id);
-        self.enumerable._add_token_to_owner_enumeration(
-            to,
-            token_id,
-            &self.erc721,
-        )?;
-
-        Ok(())
+    pub fn symbol(&self) -> Result<String, Vec<u8>> {
+        Ok($self.symbol)
     }
 
-    fn safe_transfer_from(
-        &mut self,
-        from: Address,
-        to: Address,
-        token_id: U256,
-    ) -> Result<(), Error> {
-        self.pausable.when_not_paused()?;
+    #[selector(name = "tokenURI")]
+    pub fn token_uri(&self, token_id: U256) -> Result<String, Vec<u8>> {
+        let seed = token_id.as_limbs()[0];
+        let size = 32;
+        let generations = 64; //64 works with decent performances, 128 works but the browser is slow ,  512 & 1024 out of gas error
+        let cell_size = 4;
 
-        // Retrieve the previous owner.
-        let previous_owner = self.erc721.owner_of(token_id)?;
+        let mut svg = String::with_capacity(size * size * 32);
+        svg.push_str(
+            r#"<svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg"><style>
+            @keyframes gol_pulse {
+                0% {opacity:0}
+                20% {opacity:1}
+                80% {opacity:1}
+                100% {opacity:0}
+            }
+            @keyframes gol_last {
+                0% {opacity:0}
+                20% {opacity:1}
+                100% {opacity:1}
+            }
+            .gol-cell {fill:#000;opacity:0;animation:gol_pulse 500ms forwards}
+            .gol-cell.last {animation:gol_last 500ms forwards}
+            </style>"#,
+        );
 
-        self.erc721.safe_transfer_from(from, to, token_id)?;
+        // Create dynamic grid
+        let mut grid = vec![vec![false; size]; size];
+        let mut has_cells = false;
 
-        // Update the extension's state.
-        self.enumerable._remove_token_from_owner_enumeration(
-            previous_owner,
-            token_id,
-            &self.erc721,
-        )?;
-        self.enumerable._add_token_to_owner_enumeration(
-            to,
-            token_id,
-            &self.erc721,
-        )?;
+        // Initialize first generation from seed
+        for y in 0..size {
+            for x in 0..size {
+                let v = ((x ^ y) + ((x | y) & (size - 1)) + (seed as usize)) & (size - 1);
+                if v < size / 3 {
+                    grid[y][x] = true;
+                    svg.push_str(&format!(
+                        r#"<rect class="gol-cell" x="{}" y="{}" width="{}" height="{}" style="animation-delay:0ms"/>"#,
+                        x * cell_size + 1, y * cell_size + 1, cell_size - 1, cell_size - 1
+                    ));
+                }
+            }
+        }
 
-        Ok(())
+        // Compute and render next generations
+        for gen in 1..generations {
+            let mut next = vec![vec![false; size]; size];
+            let mut next_has_cells = false;
+
+            for y in 0..size {
+                for x in 0..size {
+                    // Count the number of live neighbors for each cell
+                    // In Conway's Game of Life, each cell has 8 neighbors (horizontally, vertically, and diagonally adjacent)
+                    let mut neighbors = 0;
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            if dx == 0 && dy == 0 {
+                                continue; // Skip the cell itself
+                            }
+                            // Handle wrapping around the edges (toroidal grid)
+                            let nx = (x as i32 + dx).rem_euclid(size as i32) as usize;
+                            let ny = (y as i32 + dy).rem_euclid(size as i32) as usize;
+                            if grid[ny][nx] {
+                                neighbors += 1;
+                            }
+                        }
+                    }
+                    
+                    // Apply Conway's Game of Life rules:
+                    // 1. Any living cell with fewer than two live neighbors dies, as if dying of isolation.
+                    // 2. Any living cell with two or three live neighbors continues to live.
+                    // 3. Any living cell with more than three live neighbors dies, as if dying of overpopulation.
+                    // 4. Any dead cell with exactly three live neighbors becomes a living cell, as if those cells reproduce.
+                    next[y][x] = matches!((grid[y][x], neighbors),
+                        (true, 2) | (true, 3) | (false, 3));
+                    
+                    if next[y][x] {
+                        next_has_cells = true;
+                        let is_last = has_cells && gen == generations - 1;
+                        svg.push_str(&format!(
+                            r#"<rect class="gol-cell{}" x="{}" y="{}" width="{}" height="{}" style="animation-delay:{}ms"/>"#,
+                            if is_last { " last" } else { "" },
+                            x * cell_size + 1,
+                            y * cell_size + 1,
+                            cell_size - 1,
+                            cell_size - 1,
+                            gen * 400
+                        ));
+                    }
+                }
+            }
+            grid = next;
+            has_cells = next_has_cells;
+        }
+
+        svg.push_str("</svg>");
+        Ok(svg)
     }
+}
 
-    #[selector(name = "safeTransferFrom")]
-    fn safe_transfer_from_with_data(
-        &mut self,
-        from: Address,
-        to: Address,
-        token_id: U256,
-        data: Bytes,
-    ) -> Result<(), Error> {
-        self.pausable.when_not_paused()?;
+#[cfg(test)]
+mod tests {
+    use crate::GameOfLifeNFT;
+    use openzeppelin_stylus::token::erc721::IErc721;
+    use stylus_sdk::alloy_primitives::{address, uint};
 
-        // Retrieve the previous owner.
-        let previous_owner = self.erc721.owner_of(token_id)?;
+    #[motsu::test]
+    fn initial_balance_is_zero(contract: GameOfLifeNFT) {
+        let test_address = address!("1234567891234567891234567891234567891234");
+        let token_id = uint!(10_U256);
 
-        self.erc721.safe_transfer_from_with_data(from, to, token_id, data)?;
-
-        // Update the extension's state.
-        self.enumerable._remove_token_from_owner_enumeration(
-            previous_owner,
-            token_id,
-            &self.erc721,
-        )?;
-        self.enumerable._add_token_to_owner_enumeration(
-            to,
-            token_id,
-            &self.erc721,
-        )?;
-
-        Ok(())
-    }
-
-    fn transfer_from(
-        &mut self,
-        from: Address,
-        to: Address,
-        token_id: U256,
-    ) -> Result<(), Error> {
-        self.pausable.when_not_paused()?;
-
-        // Retrieve the previous owner.
-        let previous_owner = self.erc721.owner_of(token_id)?;
-
-        self.erc721.transfer_from(from, to, token_id)?;
-
-        // Update the extension's state.
-        self.enumerable._remove_token_from_owner_enumeration(
-            previous_owner,
-            token_id,
-            &self.erc721,
-        )?;
-        self.enumerable._add_token_to_owner_enumeration(
-            to,
-            token_id,
-            &self.erc721,
-        )?;
-
-        Ok(())
-    }
-
-    fn supports_interface(interface_id: FixedBytes<4>) -> bool {
-        Erc721::supports_interface(interface_id)
-            || Enumerable::supports_interface(interface_id)
-    }
-
-    /// WARNING: These functions are intended for **testing purposes** only. In
-    /// **production**, ensure strict access control to prevent unauthorized
-    /// pausing or unpausing, which can disrupt contract functionality. Remove
-    /// or secure these functions before deployment.
-    fn pause(&mut self) -> Result<(), Error> {
-        self.pausable.pause().map_err(|e| e.into())
-    }
-
-    fn unpause(&mut self) -> Result<(), Error> {
-        self.pausable.unpause().map_err(|e| e.into())
+        let _ = contract.erc721._mint(test_address, token_id);
+        let owner = contract.erc721.owner_of(token_id).unwrap();
+        assert_eq!(owner, test_address);
     }
 }
